@@ -1,32 +1,13 @@
-# utils_drag_teaching.py
-# 同济子豪兄 2024-5-23
-# 拖动示教 - 适用于 STS3215 舵机
-
-print('导入拖动示教模块')
-
-import time
-import os
-import sys
-import threading
 import json
-import serial
-from serial.tools import list_ports
 import numpy as np
+import os
+import time
+import threading
+from serial.tools import list_ports
 
 # 导入 lerobot 中的舵机控制模块
 from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
 from lerobot.common.robot_devices.motors.configs import FeetechMotorsBusConfig
-
-def list_serial_ports():
-    """列出所有可用的串口"""
-    ports = list_ports.comports()
-    print("\n可用的串口:")
-    for port in ports:
-        print(f"- {port.device}: {port.description}")
-    return ports
-
-# 列出所有串口
-available_ports = list_serial_ports()
 
 # 根据实际连接的COM口修改
 PORT = 'COM5'  # USB-Enhanced-SERIAL CH343
@@ -35,43 +16,13 @@ BAUDRATE = 1000000  # STS3215 默认波特率
 # 舵机参数
 MOTOR_IDS = list(range(1, 7))  # 6个舵机，ID从1到6
 
-# 检查指定的端口是否存在
-if not any(PORT == port.device for port in available_ports):
-    print(f"\n警告: {PORT} 未找到！请从上面的列表中选择正确的端口。")
-    sys.exit(1)
-
-print(f"\n尝试连接到 {PORT}...")
-
-try:
-    # 创建舵机配置
-    motors = {}
-    for i, motor_id in enumerate(MOTOR_IDS):
-        # 使用 "sts3215" 作为舵机型号
-        motors[f"joint_{i+1}"] = (motor_id, "sts3215")
-    
-    config = FeetechMotorsBusConfig(
-        port=PORT,
-        motors=motors,
-        mock=False
-    )
-    
-    # 初始化舵机总线
-    bus = FeetechMotorsBus(config)
-    bus.connect()
-    print("舵机初始化成功")
-
-except Exception as e:
-    print(f"错误: {e}")
-    sys.exit(1)
-
 class TeachingTest:
     def __init__(self, bus):
         self.bus = bus
         self.recording = False
-        self.playing = False
-        self.record_list = []
-        self.record_t = None
-        self.play_t = None
+        self.record_list = {}  # 字典，用于存储多个动作
+        self.current_recording = []  # 临时列表，用于当前录制
+        self.load_from_local()  # 在初始化时加载之前保存的动作
 
     def get_all_positions(self):
         """获取所有舵机的当前位置"""
@@ -91,13 +42,13 @@ class TeachingTest:
 
     def record(self):
         """开始录制"""
-        self.record_list = []
+        self.current_recording = []  # 初始化临时列表
         self.recording = True
         start_time = time.time()
         
         def _record():
             last_time = time.time()
-            min_interval = 0.01  # 最小采样间隔：20ms (50Hz)
+            min_interval = 0.01  # 最小采样间隔：10ms (100Hz)
             positions_buffer = []  # 用于平滑的缓冲区
             
             while self.recording:
@@ -113,18 +64,8 @@ class TeachingTest:
                             if len(positions_buffer) >= 3:
                                 # 简单的移动平均，并转换为整数
                                 smoothed = np.round(np.mean(positions_buffer[-3:], axis=0)).astype(np.int32)
-                                self.record_list.append(smoothed)
+                                self.current_recording.append(smoothed.tolist())  # 存储为列表
                                 print(f"\r Recording... Time: {current_time - start_time:.2f}s, Positions: {smoothed}", end="")
-                                
-                                # 如果变化太大，增加中间点
-                                if len(self.record_list) >= 2:
-                                    prev = self.record_list[-2]
-                                    curr = smoothed
-                                    max_diff = np.max(np.abs(curr - prev))
-                                    if max_diff > 66:  # 如果相邻位置差异太大
-                                        # 插入中间点（确保是整数）
-                                        mid = np.round((prev + curr) / 2).astype(np.int32)
-                                        self.record_list.insert(-1, mid)
                         
                         last_time = current_time
                     except Exception as e:
@@ -134,18 +75,55 @@ class TeachingTest:
                     # 短暂休眠以减少CPU使用
                     time.sleep(0.001)
 
-            print("\n录制结束，共记录 {} 个位置点".format(len(self.record_list)))
+            print("\n录制结束，共记录 {} 个位置点".format(len(self.current_recording)))
 
         print("\n开始录制动作")
         self.record_t = threading.Thread(target=_record, daemon=True)
         self.record_t.start()
 
     def stop_record(self):
-        """停止录制"""
+        """停止录制并提示保存"""
         if self.recording:
             self.recording = False
             self.record_t.join()
             print("\n停止录制动作")
+            self.save_recording()
+
+    def save_recording(self):
+        """保存录制的动作"""
+        if not self.current_recording:
+            print("\n没有可保存的动作数据")
+            return
+
+        action_number = input("请输入要保存的动作编号（1-10）：")
+        if action_number.isdigit() and 1 <= int(action_number) <= 10:
+            action_number = int(action_number)
+            self.record_list[action_number] = self.current_recording.copy()  # 保存到字典
+            print(f"\n动作 {action_number} 已保存。")
+            self.save_to_file()  # 保存到文件
+        else:
+            print("无效的输入，请输入 1 到 10 之间的数字。")
+
+    def save_to_file(self):
+        """将所有录制的动作保存到文件"""
+        try:
+            with open("recorded_actions.json", "w") as f:
+                json.dump(self.record_list, f)  # 直接保存字典
+            print("动作数据已保存到 recorded_actions.json")
+        except Exception as e:
+            print(f"保存动作数据失败: {e}")
+
+    def load_from_local(self):
+        """从文件加载动作"""
+        if os.path.exists("recorded_actions.json"):
+            try:
+                with open("recorded_actions.json", "r") as f:
+                    self.record_list = json.load(f)
+                    print("\n成功加载动作数据")
+            except Exception as e:
+                print(f"\n加载动作数据失败: {e}")
+        else:
+            print("没有找到保存的动作数据文件。")
 
     def ease_in_out_quad(self, t):
         """二次缓动函数"""
@@ -169,81 +147,54 @@ class TeachingTest:
         """回放动作"""
         print("\n开始回放动作")
         
-        try:
-            # 设置适中的加速度
-            ACC = 30
-            self.bus.write("Acceleration", ACC)
-            
-            # 设置基础速度
-            BASE_SPEED = 8000
-            self.bus.write("Goal_Speed", BASE_SPEED)
-            
-            # 遍历所有位置点
-            for i in range(len(self.record_list)-1):
-                start_pos = np.array(self.record_list[i], dtype=np.int32)
-                end_pos = np.array(self.record_list[i+1], dtype=np.int32)
-                
-                # 计算位置差异
-                diff = end_pos - start_pos
-                max_diff = np.max(np.abs(diff))
-                
-                # 根据位置差异决定插值点数量
-                if max_diff < 100:
-                    steps = 3
-                elif max_diff < 300:
-                    steps = 5
-                else:
-                    steps = 7
-                
-                # 生成插值点
-                interpolated = self.interpolate_positions(start_pos, end_pos, steps)
-                
-                # 执行插值后的动作
-                for pos in interpolated:
-                    try:
-                        self.bus.write("Goal_Position", pos)
+        action_number = input("请输入要回放的动作编号（1-10）：")
+        if action_number.isdigit() and 1 <= int(action_number) <= 10:
+            action_number = int(action_number)
+            if action_number in self.record_list:
+                positions_to_play = self.record_list[action_number]
+                try:
+                    # 设置适中的加速度
+                    ACC = 30
+                    self.bus.write("Acceleration", ACC)
+                    
+                    # 设置基础速度
+                    BASE_SPEED = 8000
+                    self.bus.write("Goal_Speed", BASE_SPEED)
+                    
+                    # 遍历所有位置点
+                    for i in range(len(positions_to_play)-1):
+                        start_pos = np.array(positions_to_play[i], dtype=np.int32)
+                        end_pos = np.array(positions_to_play[i+1], dtype=np.int32)
                         
-                        # 根据位置差异动态调整等待时间
+                        # 计算位置差异
+                        diff = end_pos - start_pos
+                        max_diff = np.max(np.abs(diff))
+                        
+                        # 根据位置差异决定插值点数量
                         if max_diff < 100:
-                            time.sleep(0.03)
+                            steps = 3
                         elif max_diff < 300:
-                            time.sleep(0.04)
+                            steps = 5
                         else:
-                            time.sleep(0.05)
-                            
-                    except Exception as e:
-                        print(f"\nError during position write: {e}")
-                        continue
-                
-        except Exception as e:
-            print(f"\nError during playback: {e}")
-            
-        print("\n回放结束")
-
-    def save_to_local(self):
-        """保存动作到文件"""
-        if not self.record_list:
-            print("\n没有可保存的动作数据")
-            return
-
-        # 将 numpy 数组转换为列表后再保存
-        save_data = [pos.tolist() if isinstance(pos, np.ndarray) else pos 
-                    for pos in self.record_list]
-        
-        save_path = os.path.dirname(__file__) + "/temp/record.txt"
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, "w") as f:
-            json.dump(save_data, f, indent=2)
-            print(f"\n动作数据已保存到: {save_path}")
-
-    def load_from_local(self):
-        """从文件加载动作"""
-        try:
-            with open(os.path.dirname(__file__) + "/temp/record.txt", "r") as f:
-                self.record_list = json.load(f)
-                print("\n成功加载动作数据")
-        except Exception as e:
-            print(f"\n加载动作数据失败: {e}")
+                            steps = 7
+                        
+                        # 生成插值点
+                        interpolated = self.interpolate_positions(start_pos, end_pos, steps)
+                        
+                        # 执行插值后的动作
+                        for pos in interpolated:
+                            try:
+                                self.bus.write("Goal_Position", pos)
+                                time.sleep(0.03)  # 等待时间
+                            except Exception as e:
+                                print(f"\nError during position write: {e}")
+                                continue
+                except Exception as e:
+                    print(f"\nError during playback: {e}")
+            else:
+                print(f"\n动作 {action_number} 不存在。")
+        else:
+            print("无效的输入，请输入 1 到 10 之间的数字。")
 
     def print_menu(self):
         print(
@@ -278,7 +229,7 @@ class TeachingTest:
                 elif key == "p":
                     self.play()
                 elif key == "s":
-                    self.save_to_local()
+                    self.save_recording()
                 elif key == "l":
                     self.load_from_local()
                 elif key == "f":
@@ -292,6 +243,20 @@ class TeachingTest:
 
 def drag_teach():
     print('开始拖动示教...')
+    # 初始化舵机总线
+    motors = {}
+    for i, motor_id in enumerate(MOTOR_IDS):
+        motors[f"joint_{i+1}"] = (motor_id, "sts3215")
+    
+    config = FeetechMotorsBusConfig(
+        port=PORT,
+        motors=motors,
+        mock=False
+    )
+    
+    bus = FeetechMotorsBus(config)
+    bus.connect()
+    
     recorder = TeachingTest(bus)
     recorder.start()
 
