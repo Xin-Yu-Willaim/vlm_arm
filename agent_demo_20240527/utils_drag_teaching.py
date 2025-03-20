@@ -1,24 +1,3 @@
-"""
-拖动示教程序 (STS3215版本)
-作者: 同济子豪兄 (优化版，支持中英文)
-功能:
-- q: 退出程序
-- r: 开始录制动作
-- c: 停止录制并编辑
-- p: 回放动作（支持速度调节）
-- s: 保存动作到指定文件
-- l: 从指定文件加载动作
-- f: 放松机械臂
-- t: 锁定机械臂
-使用说明:
-1. 确保舵机连接到指定串口（如COM5）
-2. 修改 config.json 配置串口和舵机ID
-3. 运行程序，按菜单提示操作
-注意事项:
-- 放松机械臂时注意安全
-- 保存动作时建议命名，便于管理
-"""
-
 import json
 import numpy as np
 import os
@@ -27,8 +6,9 @@ import threading
 from serial.tools import list_ports
 from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
 from lerobot.common.robot_devices.motors.configs import FeetechMotorsBusConfig
+import subprocess
 
-# 语言字典
+# 语言字典，支持中英文
 LANGUAGES = {
     "zh": {
         "welcome": "欢迎使用拖动示教程序，请选择语言：\n1. 中文\n2. 英文\n输入 1 或 2：",
@@ -36,7 +16,7 @@ LANGUAGES = {
         "start_teaching": "开始拖动示教...",
         "bus_connected": "舵机总线连接成功",
         "bus_failed": "舵机总线连接失败: {}",
-        "menu": "\n拖动示教 (STS3215版本)\nq: 退出程序\nr: 开始录制动作\nc: 停止录制动作\np: 回放动作\ns: 将录制的动作保存到本地\nl: 从本地读取录制好的动作\nf: 放松机械臂 (关闭扭矩)\nt: 锁定机械臂 (开启扭矩)\n----------------------------------",
+        "menu": "\n拖动示教 (STS3215版本)\nq: 退出程序\nr: 开始录制动作\nc: 停止录制动作\np: 回放动作\ns: 将录制的动作保存到本地\nl: 从本地读取录制好的动作\nm: 放松主臂\nu: 锁定主臂\nn: 放松从臂\nv: 锁定从臂\no: 远程操作模式\nx: 退出远程操作模式\n----------------------------------",
         "exit": "正在退出程序...",
         "prepare_record": "准备录制动作...",
         "start_record": "开始录制动作",
@@ -78,7 +58,15 @@ LANGUAGES = {
         "invalid_key": "无效按键 '{}’，请按菜单中的选项操作",
         "interrupt": "程序被用户中断",
         "error": "程序出错: {}",
-        "end": "程序结束"
+        "end": "程序结束",
+        "master_torque_off": "主臂扭矩已关闭，可能下落，请确保安全！",
+        "slave_torque_off": "从臂扭矩已关闭，可能下落，请确保安全！",
+        "master_torque_on": "主臂扭矩已开启",
+        "slave_torque_on": "从臂扭矩已开启",
+        "remote_mode_started": "远程操作模式已启动。可以通过远程设备控制从臂。",
+        "remote_mode_stopped": "远程操作模式已停止。",
+        "already_in_remote_mode": "已在远程操作模式中",
+        "not_in_remote_mode": "未在远程操作模式中"
     },
     "en": {
         "welcome": "Welcome to the Drag Teaching Program, please select a language:\n1. Chinese\n2. English\nEnter 1 or 2: ",
@@ -86,7 +74,7 @@ LANGUAGES = {
         "start_teaching": "Starting drag teaching...",
         "bus_connected": "Motor bus connected successfully",
         "bus_failed": "Motor bus connection failed: {}",
-        "menu": "\nDrag Teaching (STS3215 Version)\nq: Quit program\nr: Start recording action\nc: Stop recording action\np: Play back action\ns: Save recorded actions locally\nl: Load recorded actions from local\nf: Relax arm (disable torque)\nt: Lock arm (enable torque)\n----------------------------------",
+        "menu": "\nDrag Teaching (STS3215 Version)\nq: Quit program\nr: Start recording action\nc: Stop recording action\np: Play back action\ns: Save recorded actions locally\nl: Load recorded actions from local\nm: Relax master arm (disable torque)\nn: Relax slave arm (disable torque)\nu: Lock master arm (enable torque)\nv: Lock slave arm (enable torque)\no: Remote operation mode\nx: Exit remote operation mode\n----------------------------------",
         "exit": "Exiting program...",
         "prepare_record": "Preparing to record action...",
         "start_record": "Starting action recording",
@@ -128,18 +116,26 @@ LANGUAGES = {
         "invalid_key": "Invalid key '{}', please use options from the menu",
         "interrupt": "Program interrupted by user",
         "error": "Program error: {}",
-        "end": "Program ended"
+        "end": "Program ended",
+        "master_torque_off": "Master arm torque disabled, it may drop, ensure safety!",
+        "slave_torque_off": "Slave arm torque disabled, it may drop, ensure safety!",
+        "master_torque_on": "Master arm torque enabled",
+        "slave_torque_on": "Slave arm torque enabled",
+        "remote_mode_started": "Remote operation mode started. Control the slave arm remotely.",
+        "remote_mode_stopped": "Remote operation mode stopped.",
+        "already_in_remote_mode": "Already in remote operation mode",
+        "not_in_remote_mode": "Not in remote operation mode"
     }
 }
 
-# 全局语言变量和上次使用的文件名
+# 全局变量
 current_language = "zh"  # 默认中文
-LAST_USED_FILE = "recorded_actions.json"  # 默认文件，程序启动时尝试加载
+LAST_USED_FILE = "recorded_actions.json"  # 默认保存文件
 
 def select_language():
-    """提示用户选择语言"""
+    """选择语言"""
     global current_language
-    print(LANGUAGES["zh"]["welcome"])  # 初始提示总是中文
+    print(LANGUAGES["zh"]["welcome"])
     choice = input().strip()
     if choice == "2":
         current_language = "en"
@@ -150,111 +146,175 @@ def select_language():
         print("语言设置为中文")
 
 def load_config(config_file="config.json"):
+    """加载配置文件"""
     try:
         with open(config_file, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            if "master" not in config or "slave" not in config:
+                raise ValueError("Config must contain 'master' and 'slave' sections")
+            return config
     except Exception as e:
         print(LANGUAGES[current_language]["config_failed"].format(e))
-        return {"port": "COM5", "baudrate": 1000000, "motor_ids": [1, 2, 3, 4, 5, 6], "sample_interval": 0.01}
+        return {
+            "master": {"port": "COM5", "baudrate": 1000000, "motor_ids": [1, 2, 3, 4, 5, 6]},
+            "slave": {"port": "COM6", "baudrate": 1000000, "motor_ids": [7, 8, 9, 10, 11, 12]},
+            "sample_interval": 0.03 # 优化：减小采样间隔以提升实时性
+        }
 
 def initialize_motors(config):
-    motors = {}
-    for i, motor_id in enumerate(config["motor_ids"]):
-        motors[f"joint_{i+1}"] = (motor_id, "sts3215")
-    bus_config = FeetechMotorsBusConfig(port=config["port"], motors=motors, mock=False)
-    bus = FeetechMotorsBus(bus_config)
+    """初始化主从臂舵机总线"""
+    # 主臂
+    master_motors = {f"joint_{i+1}": (motor_id, "sts3215") for i, motor_id in enumerate(config["master"]["motor_ids"])}
+    master_bus_config = FeetechMotorsBusConfig(port=config["master"]["port"], motors=master_motors, mock=False)
+    master_bus = FeetechMotorsBus(master_bus_config)
     try:
-        bus.connect()
+        master_bus.connect()
         print(LANGUAGES[current_language]["bus_connected"])
-        return bus
     except Exception as e:
         print(LANGUAGES[current_language]["bus_failed"].format(e))
         raise
 
+    # 从臂
+    slave_motors = {f"joint_{i+1}": (motor_id, "sts3215") for i, motor_id in enumerate(config["slave"]["motor_ids"])}
+    slave_bus_config = FeetechMotorsBusConfig(port=config["slave"]["port"], motors=slave_motors, mock=False)
+    slave_bus = FeetechMotorsBus(slave_bus_config)
+    try:
+        slave_bus.connect()
+        print(LANGUAGES[current_language]["bus_connected"])
+    except Exception as e:
+        print(LANGUAGES[current_language]["bus_failed"].format(e))
+        raise
+
+    return master_bus, slave_bus
+
 class TeachingTest:
-    def __init__(self, bus):
-        self.bus = bus
+    def __init__(self, master_bus, slave_bus):
+        self.master_bus = master_bus
+        self.slave_bus = slave_bus
         self.recording = False
+        self.remote_mode = False
+        self.remote_process = None  # 远程操作进程句柄
         self.record_list = {}
         self.current_recording = []
-        self.load_from_local(LAST_USED_FILE)  # 初始化时加载上次使用的文件
+        self.load_from_local(LAST_USED_FILE)
 
-    def get_all_positions(self):
+    def set_master_torque(self, enable):
+        """设置主臂扭矩"""
         try:
-            positions = self.bus.read("Present_Position")
-            return positions
-        except Exception as e:
-            print(LANGUAGES[current_language]["torque_error"].format(e))
-            return None
-
-    def set_all_torque(self, enable):
-        try:
-            self.bus.write("Torque_Enable", enable)
+            self.master_bus.write("Torque_Enable", enable)
             if not enable:
-                print(LANGUAGES[current_language]["torque_off_warning"])
+                print(LANGUAGES[current_language]["master_torque_off"])
+            else:
+                print(LANGUAGES[current_language]["master_torque_on"])
         except Exception as e:
             print(LANGUAGES[current_language]["torque_error"].format(e))
 
-    def record(self, sample_interval=0.01):
+    def set_slave_torque(self, enable):
+        """设置从臂扭矩"""
+        try:
+            self.slave_bus.write("Torque_Enable", enable)
+            if not enable:
+                print(LANGUAGES[current_language]["slave_torque_off"])
+            else:
+                print(LANGUAGES[current_language]["slave_torque_on"])
+        except Exception as e:
+            print(LANGUAGES[current_language]["torque_error"].format(e))
+
+    def start_remote_mode(self):
+        """启动远程操作模式"""
+        if not self.remote_mode:
+            self.remote_mode = True
+            self.remote_process = subprocess.Popen([
+                "python",
+                "./control_robot.py",
+                "--robot.type=so100",
+                "--robot.cameras={}",
+                "--control.type=teleoperate"
+            ])
+            print(LANGUAGES[current_language]["remote_mode_started"])
+        else:
+            print(LANGUAGES[current_language]["already_in_remote_mode"])
+
+    def stop_remote_mode(self):
+        """停止远程操作模式"""
+        if self.remote_mode and self.remote_process:
+            self.remote_process.terminate()
+            try:
+                self.remote_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.remote_process.kill()  # 强制终止
+            self.remote_process = None
+            self.remote_mode = False
+            print(LANGUAGES[current_language]["remote_mode_stopped"])
+        else:
+            print(LANGUAGES[current_language]["not_in_remote_mode"])
+
+    def record(self, sample_interval=0.033):
+        """录制动作 - 优化：移除平滑处理，提升实时性"""
+        if self.remote_mode:
+            print(LANGUAGES[current_language]["already_in_remote_mode"])
+            return
         self.current_recording = []
         self.recording = True
         start_time = time.time()
-        
+
         def _record():
             last_time = time.time()
             min_interval = sample_interval
-            positions_buffer = []
-            
+            # 优化：设置从臂舵机的高加速度和速度
+            self.slave_bus.write("Acceleration", 50)  # 根据舵机型号调整
+            self.slave_bus.write("Goal_Speed", 4000)  # 根据舵机型号调整
             while self.recording:
                 current_time = time.time()
                 if current_time - last_time >= min_interval:
                     try:
-                        positions = self.get_all_positions()
-                        if positions is not None:
-                            positions_buffer.append(positions)
-                            if len(positions_buffer) >= 3:
-                                smoothed = np.round(np.mean(positions_buffer[-3:], axis=0)).astype(np.int32)
-                                self.current_recording.append(smoothed.tolist())
-                                print(f"\r{LANGUAGES[current_language]['recording'].format(current_time - start_time, smoothed)}", end="")
+                        master_positions = self.master_bus.read("Present_Position")
+                        if master_positions is not None:
+                            # 优化：直接发送主臂位置，移除平滑处理
+                            self.slave_bus.write("Goal_Position", master_positions)
+                            self.current_recording.append(master_positions.tolist())
+                            print(f"\r{LANGUAGES[current_language]['recording'].format(current_time - start_time, master_positions)}", end="")
                         last_time = current_time
                     except Exception as e:
                         print(f"\n{LANGUAGES[current_language]['torque_error'].format(e)}")
-                        time.sleep(0.1)
-                else:
-                    time.sleep(0.001)
+                # 优化：移除 time.sleep 以提高线程效率
+
             print(f"\n{LANGUAGES[current_language]['record_end'].format(len(self.current_recording))}")
-        
-        print(f"\n{LANGUAGES[current_language]['start_record']}")
+
+        print(LANGUAGES[current_language]["start_record"])
         self.record_t = threading.Thread(target=_record, daemon=True)
         self.record_t.start()
 
     def stop_record(self):
+        """停止录制"""
         if self.recording:
             self.recording = False
             self.record_t.join(timeout=1.0)
             if self.record_t.is_alive():
-                print(f"\n{LANGUAGES[current_language]['thread_warning']}")
+                print(LANGUAGES[current_language]["thread_warning"])
             else:
-                print(f"\n{LANGUAGES[current_language]['stop_record']}")
+                print(LANGUAGES[current_language]["stop_record"])
             self.edit_recording()
 
     def edit_recording(self):
+        """编辑录制数据"""
         if not self.current_recording:
-            print(f"\n{LANGUAGES[current_language]['no_data_edit']}")
+            print(LANGUAGES[current_language]["no_data_edit"])
             return
-        print(f"\n{LANGUAGES[current_language]['edit_info'].format(len(self.current_recording))}")
+        print(LANGUAGES[current_language]["edit_info"].format(len(self.current_recording)))
         trim_start = input(LANGUAGES[current_language]["trim_start"]).lower() == 'y'
         trim_end = input(LANGUAGES[current_language]["trim_end"]).lower() == 'y'
         if trim_start:
             self.current_recording = self.current_recording[3:]
         if trim_end and len(self.current_recording) > 3:
             self.current_recording = self.current_recording[:-3]
-        print(f"\n{LANGUAGES[current_language]['edit_result'].format(len(self.current_recording))}")
+        print(LANGUAGES[current_language]["edit_result"].format(len(self.current_recording)))
 
     def save_recording(self):
+        """保存录制数据"""
         global LAST_USED_FILE
         if not self.current_recording:
-            print(f"\n{LANGUAGES[current_language]['no_data_save']}")
+            print(LANGUAGES[current_language]["no_data_save"])
             return
         action_number = input(LANGUAGES[current_language]["input_action_save"])
         if action_number.isdigit() and 1 <= int(action_number) <= 10:
@@ -265,14 +325,15 @@ class TeachingTest:
                 "name": action_name or f"Action_{action_number}",
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
-            print(f"\n{LANGUAGES[current_language]['action_saved'].format(action_number)}")
+            print(LANGUAGES[current_language]["action_saved"].format(action_number))
             filename = input(LANGUAGES[current_language]["input_filename_save"]) or "recorded_actions.json"
-            LAST_USED_FILE = filename  # 更新上次使用的文件名
+            LAST_USED_FILE = filename
             self.save_to_file(filename)
         else:
-            print(f"\n{LANGUAGES[current_language]['invalid_input']}")
+            print(LANGUAGES[current_language]["invalid_input"])
 
     def save_to_file(self, filename="recorded_actions.json"):
+        """保存到文件"""
         try:
             with open(filename, "w") as f:
                 json.dump(self.record_list, f, indent=4)
@@ -281,29 +342,27 @@ class TeachingTest:
             print(LANGUAGES[current_language]["save_failed"].format(e))
 
     def load_from_local(self, filename="recorded_actions.json"):
+        """从本地加载"""
         if os.path.exists(filename):
             try:
                 with open(filename, "r") as f:
                     data = json.load(f)
-                    # 创建新字典，避免在迭代时修改原字典
-                    converted_data = {}
-                    for key, value in data.items():
-                        if not isinstance(key, str) or "positions" not in value:
-                            raise ValueError("Invalid action data format")
-                        converted_data[int(key)] = value  # 转换为整数键
+                    converted_data = {int(k): v for k, v in data.items() if "positions" in v}
                     self.record_list = converted_data
-                print(f"\n{LANGUAGES[current_language]['load_success'].format(filename)}")
+                print(LANGUAGES[current_language]["load_success"].format(filename))
             except Exception as e:
-                print(f"\n{LANGUAGES[current_language]['load_failed'].format(e)}")
+                print(LANGUAGES[current_language]["load_failed"].format(e))
         else:
-            print(f"\n{LANGUAGES[current_language]['file_not_found'].format(filename)}")
+            print(LANGUAGES[current_language]["file_not_found"].format(filename))
 
     def ease_in_out_quad(self, t):
+        """缓动函数"""
         if t < 0.5:
             return 2 * t * t
         return 1 - pow(-2 * t + 2, 2) / 2
 
     def interpolate_positions(self, start_pos, end_pos, steps):
+        """插值位置"""
         result = []
         for i in range(steps):
             t = i / (steps - 1)
@@ -313,7 +372,11 @@ class TeachingTest:
         return result
 
     def play(self):
-        print(f"\n{LANGUAGES[current_language]['start_play']}")
+        """回放动作"""
+        if self.remote_mode:
+            print(LANGUAGES[current_language]["already_in_remote_mode"])
+            return
+        print(LANGUAGES[current_language]["start_play"])
         action_number = input(LANGUAGES[current_language]["input_action"])
         if action_number.isdigit() and 1 <= int(action_number) <= 10:
             action_number = int(action_number)
@@ -322,86 +385,91 @@ class TeachingTest:
                 speed_factor = max(0.5, min(2.0, speed_factor))
                 positions_to_play = self.record_list[action_number]["positions"]
                 try:
-                    ACC = 30
-                    self.bus.write("Acceleration", ACC)
+                    # 优化：设置从臂舵机参数
+                    self.slave_bus.write("Acceleration", 100)
                     BASE_SPEED = int(8000 * speed_factor)
-                    self.bus.write("Goal_Speed", BASE_SPEED)
+                    self.slave_bus.write("Goal_Speed", BASE_SPEED)
                     for i in range(len(positions_to_play)-1):
                         start_pos = np.array(positions_to_play[i], dtype=np.int32)
                         end_pos = np.array(positions_to_play[i+1], dtype=np.int32)
                         diff = end_pos - start_pos
                         max_diff = np.max(np.abs(diff))
-                        if max_diff < 100:
-                            steps = 3
-                        elif max_diff < 300:
-                            steps = 5
-                        else:
-                            steps = 7
+                        steps = 3 if max_diff < 100 else 5 if max_diff < 300 else 7
                         interpolated = self.interpolate_positions(start_pos, end_pos, steps)
                         for pos in interpolated:
-                            self.bus.write("Goal_Position", pos)
+                            self.slave_bus.write("Goal_Position", pos)
                             time.sleep(0.03 / speed_factor)
                 except Exception as e:
-                    print(f"\n{LANGUAGES[current_language]['play_error'].format(e)}")
+                    print(LANGUAGES[current_language]["play_error"].format(e))
             else:
-                print(f"\n{LANGUAGES[current_language]['action_not_exist'].format(action_number)}")
+                print(LANGUAGES[current_language]["action_not_exist"].format(action_number))
         else:
-            print(f"\n{LANGUAGES[current_language]['invalid_input']}")
+            print(LANGUAGES[current_language]["invalid_input"])
 
     def print_menu(self):
+        """打印菜单"""
         print(LANGUAGES[current_language]["menu"])
 
     def start(self):
+        """启动程序"""
         self.print_menu()
         import msvcrt
         while True:
             if msvcrt.kbhit():
                 key = msvcrt.getch().decode('utf-8').lower()
                 if key == "q":
-                    print(f"\n{LANGUAGES[current_language]['exit']}")
+                    print(LANGUAGES[current_language]["exit"])
                     break
                 elif key == "r":
-                    print(f"\n{LANGUAGES[current_language]['prepare_record']}")
+                    print(LANGUAGES[current_language]["prepare_record"])
                     config = load_config()
                     self.record(config["sample_interval"])
                 elif key == "c":
-                    print(f"\n{LANGUAGES[current_language]['prepare_stop']}")
+                    print(LANGUAGES[current_language]["prepare_stop"])
                     self.stop_record()
                 elif key == "p":
-                    print(f"\n{LANGUAGES[current_language]['prepare_play']}")
+                    print(LANGUAGES[current_language]["prepare_play"])
                     self.play()
                 elif key == "s":
-                    print(f"\n{LANGUAGES[current_language]['prepare_save']}")
+                    print(LANGUAGES[current_language]["prepare_save"])
                     self.save_recording()
                 elif key == "l":
-                    print(f"\n{LANGUAGES[current_language]['prepare_load']}")
+                    print(LANGUAGES[current_language]["prepare_load"])
                     filename = input(LANGUAGES[current_language]["input_filename_load"]) or LAST_USED_FILE
                     self.load_from_local(filename)
-                elif key == "f":
-                    self.set_all_torque(0)
-                    print(f"\n{LANGUAGES[current_language]['arm_relaxed']}")
-                elif key == "t":
-                    self.set_all_torque(1)
-                    print(f"\n{LANGUAGES[current_language]['arm_locked']}")
+                elif key == "m":
+                    self.set_master_torque(0)
+                elif key == "n":
+                    self.set_slave_torque(0)
+                elif key == "u":
+                    self.set_master_torque(1)
+                elif key == "v":
+                    self.set_slave_torque(1)
+                elif key == "o":
+                    self.start_remote_mode()
+                elif key == "x":
+                    self.stop_remote_mode()
                 else:
-                    print(f"\n{LANGUAGES[current_language]['invalid_key'].format(key)}")
+                    print(LANGUAGES[current_language]["invalid_key"].format(key))
+
+        self.master_bus.disconnect()
+        self.slave_bus.disconnect()
 
 def drag_teach():
+    """主函数"""
     print(LANGUAGES[current_language]["start_teaching"])
     config = load_config()
-    bus = initialize_motors(config)
-    recorder = TeachingTest(bus)
+    master_bus, slave_bus = initialize_motors(config)
+    recorder = TeachingTest(master_bus, slave_bus)
     recorder.start()
 
 if __name__ == '__main__':
-    select_language()  # 启动时选择语言
+    select_language()
     try:
         drag_teach()
     except KeyboardInterrupt:
-        print(f"\n{LANGUAGES[current_language]['interrupt']}")
+        print(LANGUAGES[current_language]["interrupt"])
     except Exception as e:
-        print(f"\n{LANGUAGES[current_language]['error'].format(e)}")
+        print(LANGUAGES[current_language]["error"].format(e))
     finally:
-        print(f"\n{LANGUAGES[current_language]['end']}")
-        if 'bus' in globals():
-            bus.disconnect()
+        print(LANGUAGES[current_language]["end"])
